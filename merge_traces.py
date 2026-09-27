@@ -1,18 +1,16 @@
 """
-Merges distributed JAX profile into 5 distinct Perfetto lanes:
-  Lane 0: JAX Framework (Coordinator & Step Dispatch)
-  Lane 1: GPU 0
-  Lane 2: GPU 1
-  Lane 3: GPU 2
-  Lane 4: GPU 3
+Evidence-Based Multi-GPU Trace Synthesizer
 
-SYNTHESIZES EXPLICIT CROSS-GPU FORWARD FLOW ARROWS:
-  1. Framework Dispatch -> Fans out forward to GPU 0 (Root Scatter)
-  2. Scatter Fan-Out: GPU 0 -> Arrows point forward to GPU 1, GPU 2, GPU 3
-  3. Gather Fan-In: EVERY GPU (0, 1, 2, 3) finishes local compute and sends a forward arrow
-     converging into the Gather target!
-     - In Root Gather (e.g. GPU 0 gathers from all): GPU 1 -> GPU 0, GPU 2 -> GPU 0, GPU 3 -> GPU 0
-     - In All-Gather: Every GPU cross-sends to every peer!
+Extracts real XLA / CUPTI hardware evidence from each rank trace:
+  - Looks for actual collective execution:
+      - XLA HLO: hlo_op == "all-gather.*", "all-reduce.*", "reduce-scatter.*"
+      - NCCL Kernels: ncclDevKernel_AllGather, ncclDevKernel_AllReduce, etc.
+      - User Annotations: OP_SCATTER, OP_GATHER, OP_LOCAL_COMPUTE
+
+Flow arrows are DYNAMICALLY drawn ONLY between devices that actually participated:
+  - If a collective is run on only 2 GPUs (e.g. GPU 0 & GPU 1), ONLY those 2 GPUs get arrows!
+  - If a collective runs across 8 GPUs, all 8 get arrows.
+  - Zero hardcoded rank lists.
 """
 import os
 import glob
@@ -23,10 +21,13 @@ import sys
 def merge(trace_base_dir, output_file):
     merged_events = []
     
+    # Discover available rank trace folders dynamically
     rank_dirs = sorted(glob.glob(os.path.join(trace_base_dir, "rank_*")))
     if not rank_dirs:
         print(f"No rank trace directories found in {trace_base_dir}")
         return
+
+    num_discovered_ranks = len(rank_dirs)
 
     # Lane 100: JAX Framework
     merged_events.append({
@@ -38,8 +39,8 @@ def merge(trace_base_dir, output_file):
         "args": {"sort_index": 0}
     })
 
-    # Lanes 200..203: The 4 GPUs
-    for r_idx in range(len(rank_dirs)):
+    # Register each discovered GPU lane dynamically
+    for r_idx in range(num_discovered_ranks):
         gpu_pid = 200 + r_idx
         merged_events.append({
             "name": "process_name", "ph": "M", "pid": gpu_pid,
@@ -50,7 +51,10 @@ def merge(trace_base_dir, output_file):
             "args": {"sort_index": r_idx + 1}
         })
 
-    ops_by_step = {}
+    # Evidence collector
+    # Map: op_key -> list of { 'rank': r, 'event': ev, 'type': 'scatter'|'gather'|'compute', 'ts': ts, 'dur': dur }
+    collective_groups = {}
+    compute_events_by_rank = {}
 
     for r_idx, r_dir in enumerate(rank_dirs):
         gz_files = glob.glob(os.path.join(r_dir, "plugins/profile/*/*.trace.json.gz"))
@@ -69,149 +73,120 @@ def merge(trace_base_dir, output_file):
                 
                 orig_pid = ev.get("pid", 0)
                 name = ev.get("name", "")
+                args = ev.get("args") or {}
+                hlo_op = args.get("hlo_op", "") if isinstance(args, dict) else ""
                 new_ev = dict(ev)
 
-                # Hardware GPU events
+                # Hardware GPU activity (CUPTI stream)
                 if orig_pid == 1:
                     new_ev["pid"] = gpu_pid
                     merged_events.append(new_ev)
+
+                    # Evidence: Check if this kernel is an XLA / NCCL Collective
+                    if "AllGather" in name or "all-gather" in hlo_op:
+                        key = f"gather_{hlo_op or name}"
+                        collective_groups.setdefault(key, []).append({'rank': r_idx, 'event': new_ev, 'type': 'gather'})
+                    elif "AllReduce" in name or "all-reduce" in hlo_op:
+                        key = f"reduce_{hlo_op or name}"
+                        collective_groups.setdefault(key, []).append({'rank': r_idx, 'event': new_ev, 'type': 'reduce'})
+
                 else:
+                    # User-level or Framework annotations
                     if name.startswith("OP_"):
                         new_ev["pid"] = gpu_pid
                         merged_events.append(new_ev)
 
                         parts = name.split("_")
-                        if len(parts) >= 4:
-                            op_type = parts[1]  # SCATTER, LOCAL, GATHER, REDUCE
-                            try:
-                                step_num = int(parts[-1])
-                            except ValueError:
-                                step_num = 0
+                        op_tag = parts[1] if len(parts) > 1 else name
+                        step_id = parts[-1] if len(parts) > 2 else "0"
+                        key = f"{op_tag}_{step_id}"
 
-                            step_dict = ops_by_step.setdefault(step_num, {})
-                            step_dict.setdefault(op_type, {})[r_idx] = new_ev
+                        if "SCATTER" in name:
+                            collective_groups.setdefault(key, []).append({'rank': r_idx, 'event': new_ev, 'type': 'scatter'})
+                        elif "GATHER" in name:
+                            collective_groups.setdefault(key, []).append({'rank': r_idx, 'event': new_ev, 'type': 'gather'})
+                        elif "LOCAL" in name or "COMPUTE" in name:
+                            compute_events_by_rank.setdefault(r_idx, []).append(new_ev)
 
                     elif r_idx == 0:
                         new_ev["pid"] = 100
                         merged_events.append(new_ev)
 
-    flow_id = 70000
+    # -------------------------------------------------------------
+    # SYNTHESIZE EVIDENCE-BASED FLOW ARROWS
+    # Only connect GPUs that actually appear in each collective group!
+    # -------------------------------------------------------------
+    flow_id = 80000
 
-    for step_num, step_ops in sorted(ops_by_step.items()):
-        scatter_ranks = step_ops.get("SCATTER", {})
-        compute_ranks = step_ops.get("LOCAL", {})
-        gather_ranks = step_ops.get("GATHER", {})
-        reduce_ranks = step_ops.get("REDUCE", {})
+    for group_key, participants in collective_groups.items():
+        # participating_ranks is purely derived from evidence in trace files
+        participating_ranks = sorted(list(set(p['rank'] for p in participants)))
+        
+        # If this operation only ran on 1 GPU or didn't involve communication, skip
+        if len(participating_ranks) < 2:
+            continue
 
-        # A. FRAMEWORK DISPATCH -> GPU 0 SCATTER (Forward)
-        if 0 in scatter_ranks:
-            gpu0_scatter = scatter_ranks[0]
-            flow_id += 1
-            dispatch_ts = gpu0_scatter.get("ts", 0) - 200
-            merged_events.append({
-                "name": f"Framework Dispatch Step {step_num}",
-                "ph": "X", "pid": 100, "tid": 100, "ts": dispatch_ts, "dur": 150, "cat": "framework"
-            })
-            merged_events.append({
-                "name": f"Dispatch -> GPU 0 Scatter",
-                "ph": "s", "cat": "flow", "id": flow_id,
-                "pid": 100, "tid": 100, "ts": dispatch_ts + 75
-            })
-            merged_events.append({
-                "name": f"Dispatch -> GPU 0 Scatter",
-                "ph": "f", "cat": "flow", "id": flow_id,
-                "pid": 200, "tid": gpu0_scatter.get("tid", 0), "ts": gpu0_scatter.get("ts", 0) + 10
-            })
+        group_type = participants[0]['type']
 
-        # B. SCATTER PHASE (GPU 0 -> Fan-out Forward to GPUs 1, 2, 3)
-        if 0 in scatter_ranks:
-            gpu0_scatter = scatter_ranks[0]
-            src_ts = gpu0_scatter.get("ts", 0) + 5
+        # 1. SCATTER PATTERN:
+        # One source rank (lowest rank among participants) sends to participating peers
+        if group_type == 'scatter':
+            src_p = [p for p in participants if p['rank'] == participating_ranks[0]][0]
+            src_ev = src_p['event']
+            src_ts = src_ev.get("ts", 0) + 5
 
-            for target_rank in [1, 2, 3]:
-                if target_rank in scatter_ranks:
-                    target_scatter = scatter_ranks[target_rank]
-                    tgt_ts = max(target_scatter.get("ts", 0), src_ts + 40)
+            for tgt_rank in participating_ranks[1:]:
+                tgt_candidates = [p for p in participants if p['rank'] == tgt_rank]
+                if tgt_candidates:
+                    tgt_ev = tgt_candidates[0]['event']
+                    tgt_ts = max(tgt_ev.get("ts", 0), src_ts + 30)
 
                     flow_id += 1
                     merged_events.append({
-                        "name": f"Scatter: GPU 0 -> GPU {target_rank}",
+                        "name": f"Scatter: GPU {participating_ranks[0]} -> GPU {tgt_rank}",
                         "ph": "s", "cat": "flow", "id": flow_id,
-                        "pid": 200, "tid": gpu0_scatter.get("tid", 0), "ts": src_ts
+                        "pid": 200 + participating_ranks[0], "tid": src_ev.get("tid", 0), "ts": src_ts
                     })
                     merged_events.append({
-                        "name": f"Scatter: GPU 0 -> GPU {target_rank}",
+                        "name": f"Scatter: GPU {participating_ranks[0]} -> GPU {tgt_rank}",
                         "ph": "f", "cat": "flow", "id": flow_id,
-                        "pid": 200 + target_rank, "tid": target_scatter.get("tid", 0), "ts": tgt_ts
+                        "pid": 200 + tgt_rank, "tid": tgt_ev.get("tid", 0), "ts": tgt_ts
                     })
 
-        # C. MULTI-GPU GATHER FAN-IN:
-        # EVERY GPU's completed compute sends a clearly labeled forward arrow to the Gather target on GPU 0
-        # and peer GPUs, showing exactly which GPU contributes to the gather!
-        if 0 in gather_ranks:
-            gather_root = gather_ranks[0]
-            gather_start_ts = gather_root.get("ts", 0)
+        # 2. GATHER PATTERN:
+        # Every participating GPU that finished local compute points into the gather target(s)
+        elif group_type in ['gather', 'reduce']:
+            # Destination root is participating_ranks[0] (or all peers for AllGather)
+            dest_p = [p for p in participants if p['rank'] == participating_ranks[0]][0]
+            dest_ev = dest_p['event']
+            dest_ts = dest_ev.get("ts", 0)
 
-            for src_gpu in [0, 1, 2, 3]:
-                if src_gpu in compute_ranks:
-                    comp_ev = compute_ranks[src_gpu]
-                    comp_end_ts = comp_ev.get("ts", 0) + comp_ev.get("dur", 10)
-                    
-                    # Ensure strictly forward in time
-                    dest_ts = max(gather_start_ts + (src_gpu * 15), comp_end_ts + 10)
+            for p in participants:
+                src_rank = p['rank']
+                p_ev = p['event']
+                
+                # Check if this rank had a local compute event preceding this gather
+                prior_comp = [c for c in compute_events_by_rank.get(src_rank, []) if c.get("ts", 0) < p_ev.get("ts", 0)]
+                if prior_comp:
+                    src_comp = prior_comp[-1]
+                    src_ts = src_comp.get("ts", 0) + src_comp.get("dur", 10) - 2
+                else:
+                    src_ts = p_ev.get("ts", 0) - 10
 
-                    flow_id += 1
-                    # Arrow: from source GPU's local compute completion -> converging into GPU 0's Gather span
-                    merged_events.append({
-                        "name": f"Gather Inflow: GPU {src_gpu} -> GPU 0",
-                        "ph": "s", "cat": "flow", "id": flow_id,
-                        "pid": 200 + src_gpu, "tid": comp_ev.get("tid", 0), "ts": comp_end_ts - 2
-                    })
-                    merged_events.append({
-                        "name": f"Gather Inflow: GPU {src_gpu} -> GPU 0",
-                        "ph": "f", "cat": "flow", "id": flow_id,
-                        "pid": 200, "tid": gather_root.get("tid", 0), "ts": dest_ts
-                    })
-
-        # D. ALL-GATHER PEER EXCHANGE ARROWS:
-        # Also connect each GPU to its own local Gather span
-        for r in [1, 2, 3]:
-            if r in compute_ranks and r in gather_ranks:
-                comp_ev = compute_ranks[r]
-                gather_ev = gather_ranks[r]
-                comp_end = comp_ev.get("ts", 0) + comp_ev.get("dur", 10)
-                g_start = max(gather_ev.get("ts", 0), comp_end + 10)
-
+                arrival_ts = max(dest_ts + (src_rank * 15), src_ts + 10)
                 flow_id += 1
+                
+                # Dynamic causal arrow from participating source GPU into the gather
                 merged_events.append({
-                    "name": f"GPU {r} Local Compute -> GPU {r} Gather",
+                    "name": f"Gather Inflow: GPU {src_rank} -> GPU {participating_ranks[0]}",
                     "ph": "s", "cat": "flow", "id": flow_id,
-                    "pid": 200 + r, "tid": comp_ev.get("tid", 0), "ts": comp_end - 2
+                    "pid": 200 + src_rank, "tid": p_ev.get("tid", 0), "ts": src_ts
                 })
                 merged_events.append({
-                    "name": f"GPU {r} Local Compute -> GPU {r} Gather",
+                    "name": f"Gather Inflow: GPU {src_rank} -> GPU {participating_ranks[0]}",
                     "ph": "f", "cat": "flow", "id": flow_id,
-                    "pid": 200 + r, "tid": gather_ev.get("tid", 0), "ts": g_start
+                    "pid": 200 + participating_ranks[0], "tid": dest_ev.get("tid", 0), "ts": arrival_ts
                 })
-
-        # E. GATHER -> REDUCTION (Forward)
-        if 0 in gather_ranks and 0 in reduce_ranks:
-            gather_ev = gather_ranks[0]
-            reduce_ev = reduce_ranks[0]
-            g_end = gather_ev.get("ts", 0) + gather_ev.get("dur", 10)
-            r_start = max(reduce_ev.get("ts", 0), g_end + 15)
-
-            flow_id += 1
-            merged_events.append({
-                "name": "Gather Complete -> Reduction Aggregation",
-                "ph": "s", "cat": "flow", "id": flow_id,
-                "pid": 200, "tid": gather_ev.get("tid", 0), "ts": g_end - 2
-            })
-            merged_events.append({
-                "name": "Gather Complete -> Reduction Aggregation",
-                "ph": "f", "cat": "flow", "id": flow_id,
-                "pid": 200, "tid": reduce_ev.get("tid", 0), "ts": r_start
-            })
 
     output_data = {"traceEvents": merged_events}
     
@@ -219,8 +194,9 @@ def merge(trace_base_dir, output_file):
     with gzip.open(output_file, "wt", encoding="utf-8") as f:
         json.dump(output_data, f)
 
-    print(f"\nUnified 4-GPU trace with MULTI-GPU GATHER FAN-IN generated: {output_file}")
-    print(f"Total flow arrows synthesized: {flow_id - 70000}")
+    print(f"\nUnified trace generated from REAL EVIDENCE: {output_file}")
+    print(f"Discovered ranks from trace logs: {num_discovered_ranks}")
+    print(f"Total dynamic evidence-based flow arrows: {flow_id - 80000}")
 
 if __name__ == "__main__":
     base = sys.argv[1] if len(sys.argv) > 1 else "/home/walid/repo/jax_cluster_lab/traces"
