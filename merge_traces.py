@@ -1,10 +1,10 @@
 """
-Merges individual rank Perfetto traces into a single unified multi-GPU cluster trace.
-Each rank gets its own distinct Process & Thread track in Perfetto:
-  - GPU 0 (Rank 0) / Host 0
-  - GPU 1 (Rank 1) / Host 1
-  - GPU 2 (Rank 2) / Host 2
-  - GPU 3 (Rank 3) / Host 3
+Merges distributed JAX profile into 5 distinct Perfetto lanes:
+  Lane 0: JAX Framework (Coordinator, Global Dispatch, Step Annotations)
+  Lane 1: GPU 0 (Rank 0 Device Activity)
+  Lane 2: GPU 1 (Rank 1 Device Activity)
+  Lane 3: GPU 2 (Rank 2 Device Activity)
+  Lane 4: GPU 3 (Rank 3 Device Activity)
 """
 import os
 import glob
@@ -15,13 +15,40 @@ import sys
 def merge(trace_base_dir, output_file):
     merged_events = []
     
-    # Locate all rank trace directories
     rank_dirs = sorted(glob.glob(os.path.join(trace_base_dir, "rank_*")))
     if not rank_dirs:
         print(f"No rank trace directories found in {trace_base_dir}")
         return
 
-    print(f"Found {len(rank_dirs)} rank traces to merge into unified 4-GPU view:")
+    # Track 100: JAX Framework Lane
+    merged_events.append({
+        "name": "process_name",
+        "ph": "M",
+        "pid": 100,
+        "args": {"name": "JAX Framework [Cluster Coordinator & Step Dispatch]"}
+    })
+    merged_events.append({
+        "name": "process_sort_index",
+        "ph": "M",
+        "pid": 100,
+        "args": {"sort_index": 0}
+    })
+
+    # Create 4 discrete GPU device tracks: PIDs 200, 201, 202, 203
+    for r_idx in range(len(rank_dirs)):
+        gpu_pid = 200 + r_idx
+        merged_events.append({
+            "name": "process_name",
+            "ph": "M",
+            "pid": gpu_pid,
+            "args": {"name": f"GPU {r_idx} [Hardware Stream & Kernels]"}
+        })
+        merged_events.append({
+            "name": "process_sort_index",
+            "ph": "M",
+            "pid": gpu_pid,
+            "args": {"sort_index": r_idx + 1}
+        })
 
     for r_idx, r_dir in enumerate(rank_dirs):
         gz_files = glob.glob(os.path.join(r_dir, "plugins/profile/*/*.trace.json.gz"))
@@ -29,59 +56,29 @@ def merge(trace_base_dir, output_file):
             continue
         
         gz_path = gz_files[0]
-        print(f"  Processing Rank {r_idx}: {gz_path}")
-
         with gzip.open(gz_path, "rt", encoding="utf-8") as f:
             data = json.load(f)
             events = data.get("traceEvents", [])
 
-            # Offset PIDs so each rank occupies distinct tracks in Perfetto
-            # Rank 0: GPU PID 1000, Host PID 2000
-            # Rank 1: GPU PID 1001, Host PID 2001, etc.
-            gpu_pid = 1000 + r_idx
-            host_pid = 2000 + r_idx
-
-            # Track metadata overrides
-            merged_events.append({
-                "name": "process_name",
-                "ph": "M",
-                "pid": gpu_pid,
-                "args": {"name": f"GPU {r_idx} [Simulated Device {r_idx}]"}
-            })
-            merged_events.append({
-                "name": "process_sort_index",
-                "ph": "M",
-                "pid": gpu_pid,
-                "args": {"sort_index": r_idx * 2}
-            })
-            merged_events.append({
-                "name": "process_name",
-                "ph": "M",
-                "pid": host_pid,
-                "args": {"name": f"Host {r_idx} Engine [Rank {r_idx}]"}
-            })
-            merged_events.append({
-                "name": "process_sort_index",
-                "ph": "M",
-                "pid": host_pid,
-                "args": {"sort_index": r_idx * 2 + 1}
-            })
+            gpu_pid = 200 + r_idx
 
             for ev in events:
                 if ev.get("name") in ["process_name", "process_sort_index"]:
-                    continue  # We set custom distinct names above
+                    continue
                 
-                # Copy event
-                new_ev = dict(ev)
                 orig_pid = ev.get("pid", 0)
+                new_ev = dict(ev)
 
-                # Remap PID: 1 is /device:GPU:0 in JAX xplane, other pids are Host CPU
+                # orig_pid == 1 represents the GPU Stream / CUDA device activity in JAX xplane
                 if orig_pid == 1:
                     new_ev["pid"] = gpu_pid
+                    merged_events.append(new_ev)
                 else:
-                    new_ev["pid"] = host_pid
-
-                merged_events.append(new_ev)
+                    # Host CPU / Framework traces
+                    # Only take Rank 0's framework trace so we have 1 clean JAX Framework timeline
+                    if r_idx == 0:
+                        new_ev["pid"] = 100
+                        merged_events.append(new_ev)
 
     output_data = {"traceEvents": merged_events}
     
@@ -89,8 +86,12 @@ def merge(trace_base_dir, output_file):
     with gzip.open(output_file, "wt", encoding="utf-8") as f:
         json.dump(output_data, f)
 
-    print(f"\nUnified 4-GPU trace generated: {output_file}")
-    print(f"Total events across all 4 GPUs: {len(merged_events)}")
+    print(f"Synthesized exactly 5 tracks into {output_file}")
+    print("  -> Track 0: JAX Framework (Coordinator & Step Dispatch)")
+    print("  -> Track 1: GPU 0")
+    print("  -> Track 2: GPU 1")
+    print("  -> Track 3: GPU 2")
+    print("  -> Track 4: GPU 3")
 
 if __name__ == "__main__":
     base = sys.argv[1] if len(sys.argv) > 1 else "/home/walid/repo/jax_cluster_lab/traces"
