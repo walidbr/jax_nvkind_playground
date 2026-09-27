@@ -6,7 +6,7 @@ $ cluster_cmd: echo -e "start\nenter-cp\nstop"
 
 # Run distributed JAX experiment on 4 simulated GPUs
 make <experiment_cmd>
-$ experiment_cmd: echo -e "run-collectives\nrun-sharding\nrun-transformer"
+$ experiment_cmd: echo -e "run-profile\nrun-collectives\nrun-sharding\nrun-transformer"
 
 # Step into control-plane container directly
 docker exec -it nvkind-cluster-control-plane bash -c "cd /workspace && exec bash"
@@ -17,18 +17,17 @@ docker exec -it nvkind-cluster-worker bash -c "cd /workspace && exec bash"
 # Run custom script across 4 simulated ranks (args: ranks port script_path)
 ./launch_cluster.sh <ranks> <port> <script>
 $ ranks: echo -e "4\n2\n8"
-$ port: echo -e "12380\n12381\n12382\n12383"
+$ port: echo -e "12380\n12381\n12382\n12385"
 $ script: find . -maxdepth 1 -name "*.py" | sed 's|^\./||'
+
+# Show generated Perfetto trace files to drag into https://ui.perfetto.dev
+find ./traces -name "*.trace.json.gz"
 
 # View logs from a specific rank or all ranks
 make logs
 
 # View specific rank log
 cat rank_<rank_id>.log
-$ rank_id: echo -e "0\n1\n2\n3"
-
-# Follow real-time rank logs
-tail -f rank_<rank_id>.log
 $ rank_id: echo -e "0\n1\n2\n3"
 
 # Check GPU VRAM and active compute processes

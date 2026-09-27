@@ -59,3 +59,14 @@ clean:
 	@pkill -9 -f "02_sharding_and_placement.py" 2>/dev/null || true
 	@pkill -9 -f "03_model_parallel_transformer.py" 2>/dev/null || true
 	@echo "Cleaned up active cluster processes."
+
+run-profile:
+	@rm -rf $(DIR)/traces
+	@$(DIR)/launch_cluster.sh 4 12385 $(DIR)/04_profiled_collectives.py
+	@echo ""
+	@echo "=========================================================="
+	@echo " Trace captured! Files located in $(DIR)/traces:"
+	@find $(DIR)/traces -type f
+	@echo ""
+	@echo " To view: Open https://ui.perfetto.dev and drag in the .trace.json.gz file"
+	@echo "=========================================================="
