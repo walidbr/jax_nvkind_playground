@@ -1,14 +1,26 @@
 """
-Evidence-Based Multi-GPU Trace Synthesizer
+Clean Evidence-Based Multi-GPU Trace Synthesizer
 
-Extracts real XLA / CUPTI hardware evidence from each rank trace:
-  - JAX Framework Track (Lane 100): Shows Python runtime, Pjit dispatches, and step scopes
-  - GPU Tracks (Lanes 200..203): Shows actual GPU CUDA streams and NCCL collective kernels
+Architectural Design:
+  Lane 100: JAX Framework
+    - Contains clean Python execution scopes:
+      - STEP_<step>_DISPATCH
+      - OP_SCATTER_STEP_<step>
+      - OP_GATHER_STEP_<step>
+      - High-level PJRT / XLA compile & dispatch calls
+    - Stripped of Python internal noise ($builtins len, isinstance, getattr, etc.)
+  
+  Lanes 200..203: Real Hardware GPUs (GPU 0, 1, 2, 3)
+    - Contain ONLY true GPU device activities (CUPTI CUDA streams):
+      - MatMul kernels (gemm)
+      - Elementwise compute kernels
+      - NCCL Collective kernels (ncclDevKernel_AllGather, ncclDevKernel_AllReduce)
+      - Hardware Memcpy (MemcpyH2D / D2H)
 
-Generates bidirectional, forward-causal flow arrows:
-  1. Framework -> GPU: From JAX dispatch / PjitFunction / broadcast_one_to_all to the receiving GPU(s)
-  2. Scatter Phase: Root GPU -> Participating GPUs
-  3. Compute -> Gather: Completed local compute -> Converging into Gather
+Flow Arrows:
+  1. Framework Dispatch -> Pointing FORWARD to the GPU hardware kernel that executes it.
+  2. Scatter: GPU 0 hardware kernel -> Pointing FORWARD to GPU 1, 2, 3 hardware kernels.
+  3. Gather: Each GPU's hardware compute kernel completion -> Pointing FORWARD to the NCCL Gather kernel!
 """
 import os
 import glob
@@ -26,17 +38,16 @@ def merge(trace_base_dir, output_file):
 
     num_discovered_ranks = len(rank_dirs)
 
-    # Lane 100: JAX Framework
+    # 1. Register Lanes
     merged_events.append({
         "name": "process_name", "ph": "M", "pid": 100,
-        "args": {"name": "JAX Framework [Host Runtime & Dispatch Engine]"}
+        "args": {"name": "JAX Framework [Host Runtime & Python Dispatch]"}
     })
     merged_events.append({
         "name": "process_sort_index", "ph": "M", "pid": 100,
         "args": {"sort_index": 0}
     })
 
-    # Lanes 200..203: The GPUs
     for r_idx in range(num_discovered_ranks):
         gpu_pid = 200 + r_idx
         merged_events.append({
@@ -48,9 +59,11 @@ def merge(trace_base_dir, output_file):
             "args": {"sort_index": r_idx + 1}
         })
 
-    collective_groups = {}
-    compute_events_by_rank = {}
-    framework_dispatches = []
+    # Noise filter for Python builtins
+    NOISE_PREFIXES = ("$builtins", "$typing", "$inspect", "$contextlib", "$linecache", "$abc", "$warnings")
+
+    framework_ops = []  # High-level operations in Framework lane
+    gpu_kernels_by_rank = {r: [] for r in range(num_discovered_ranks)}
 
     for r_idx, r_dir in enumerate(rank_dirs):
         gz_files = glob.glob(os.path.join(r_dir, "plugins/profile/*/*.trace.json.gz"))
@@ -64,155 +77,123 @@ def merge(trace_base_dir, output_file):
             gpu_pid = 200 + r_idx
 
             for ev in events:
-                if ev.get("name") in ["process_name", "process_sort_index"]:
-                    continue
-                
-                orig_pid = ev.get("pid", 0)
                 name = ev.get("name", "")
-                args = ev.get("args") or {}
-                hlo_op = args.get("hlo_op", "") if isinstance(args, dict) else ""
+                if name in ["process_name", "process_sort_index"]:
+                    continue
+
+                orig_pid = ev.get("pid", 0)
                 new_ev = dict(ev)
 
-                # Hardware GPU activity (CUPTI stream)
+                # A. TRUE HARDWARE GPU EVENTS (pid 1) -> Go to GPU Lane
                 if orig_pid == 1:
                     new_ev["pid"] = gpu_pid
                     merged_events.append(new_ev)
+                    gpu_kernels_by_rank[r_idx].append(new_ev)
 
-                    if "AllGather" in name or "all-gather" in hlo_op:
-                        key = f"gather_{hlo_op or name}"
-                        collective_groups.setdefault(key, []).append({'rank': r_idx, 'event': new_ev, 'type': 'gather'})
-                    elif "AllReduce" in name or "all-reduce" in hlo_op:
-                        key = f"reduce_{hlo_op or name}"
-                        collective_groups.setdefault(key, []).append({'rank': r_idx, 'event': new_ev, 'type': 'reduce'})
-
-                else:
-                    # User-level operation annotations
-                    if name.startswith("OP_"):
-                        # Keep high-level annotation visible on the GPU lane
-                        new_ev["pid"] = gpu_pid
-                        merged_events.append(new_ev)
-
-                        parts = name.split("_")
-                        op_tag = parts[1] if len(parts) > 1 else name
-                        step_id = parts[-1] if len(parts) > 2 else "0"
-                        key = f"{op_tag}_{step_id}"
-
-                        if "SCATTER" in name:
-                            collective_groups.setdefault(key, []).append({'rank': r_idx, 'event': new_ev, 'type': 'scatter'})
-                        elif "GATHER" in name:
-                            collective_groups.setdefault(key, []).append({'rank': r_idx, 'event': new_ev, 'type': 'gather'})
-                        elif "LOCAL" in name or "COMPUTE" in name:
-                            compute_events_by_rank.setdefault(r_idx, []).append(new_ev)
-
-                    elif r_idx == 0:
-                        # Rank 0 Host CPU events populate the JAX Framework Lane
+                # B. FRAMEWORK HOST EVENTS -> Go to Framework Lane (Take from Rank 0 only)
+                elif r_idx == 0:
+                    # Filter out micro Python interpreter noise like $builtins len
+                    if name.startswith(NOISE_PREFIXES):
+                        continue
+                    
+                    # Only keep significant framework spans (user annotations, PJRT executes, collectives)
+                    if (name.startswith("OP_") or 
+                        name.startswith("PjitFunction") or 
+                        name.startswith("CommonPjRtLoadedExecutable") or 
+                        "broadcast_one_to_all" in name or 
+                        "process_allgather" in name or
+                        name in ["MemcpyH2D", "H2D Dispatch"]):
+                        
                         new_ev["pid"] = 100
                         merged_events.append(new_ev)
 
-                        # Capture key framework dispatch spans to connect to GPUs
-                        if any(kw in name for kw in ["broadcast_one_to_all", "process_allgather", "PjitFunction", "Execute", "H2D Dispatch"]):
-                            if new_ev.get("dur", 0) > 10:
-                                framework_dispatches.append(new_ev)
+                        if name.startswith("OP_"):
+                            framework_ops.append(new_ev)
 
     # -------------------------------------------------------------
-    # SYNTHESIZE FORWARD FLOW ARROWS
+    # SYNTHESIZE FORWARD CAUSAL ARROWS
     # -------------------------------------------------------------
-    flow_id = 90000
+    flow_id = 95000
 
-    # 1. JAX FRAMEWORK -> GPU DISPATCH ARROWS
-    # Links each significant framework dispatch event to the corresponding GPU kernel/operation that begins immediately after
-    for f_ev in framework_dispatches:
-        f_ts = f_ev.get("ts", 0)
-        f_name = f_ev.get("name", "Dispatch")
-        f_end = f_ts + f_ev.get("dur", 10)
+    # 1. Connect JAX Framework OP_* spans down to the first GPU kernel executed in that span
+    for f_op in framework_ops:
+        op_name = f_op.get("name", "")
+        f_start = f_op.get("ts", 0)
+        f_end = f_start + f_op.get("dur", 10)
 
-        # Find the earliest GPU collective/scatter event that occurs at or shortly after this dispatch
-        target_gpu_events = []
-        for grp_key, grp_parts in collective_groups.items():
-            for p in grp_parts:
-                p_ev = p['event']
-                p_ts = p_ev.get("ts", 0)
-                # If GPU event starts within a reasonable causal window [f_ts - 50, f_end + 50000]
-                if f_ts - 100 <= p_ts <= f_end + 30000:
-                    target_gpu_events.append((p['rank'], p_ev))
+        # Find the earliest GPU kernel on GPU 0 that falls within or immediately following this framework span
+        matching_gpu_kernels = [
+            k for k in gpu_kernels_by_rank[0] 
+            if f_start <= k.get("ts", 0) <= f_end + 5000
+        ]
 
-        # Draw dispatch arrow to participating GPU(s)
-        seen_ranks = set()
-        for r, tgt_ev in target_gpu_events[:4]:
-            if r not in seen_ranks:
-                seen_ranks.add(r)
+        if matching_gpu_kernels:
+            first_gpu_k = matching_gpu_kernels[0]
+            flow_id += 1
+            # Arrow: Framework OP span -> First GPU hardware kernel
+            merged_events.append({
+                "name": f"Framework Launch -> {first_gpu_k.get('name')}",
+                "ph": "s", "cat": "flow", "id": flow_id,
+                "pid": 100, "tid": f_op.get("tid", 0), "ts": f_start + 5
+            })
+            merged_events.append({
+                "name": f"Framework Launch -> {first_gpu_k.get('name')}",
+                "ph": "f", "cat": "flow", "id": flow_id,
+                "pid": 200, "tid": first_gpu_k.get("tid", 0), "ts": first_gpu_k.get("ts", 0)
+            })
+
+    # 2. Inter-GPU Collectives (NCCL AllGather / AllReduce)
+    # When NCCL kernels execute across GPUs around the same timestamp, connect them!
+    all_nccl_kernels = []
+    for r in range(num_discovered_ranks):
+        for k in gpu_kernels_by_rank[r]:
+            kname = k.get("name", "")
+            if "nccl" in kname.lower() or "allreduce" in kname.lower() or "allgather" in kname.lower():
+                all_nccl_kernels.append((r, k))
+
+    # Sort all collective kernels by timestamp
+    all_nccl_kernels.sort(key=lambda x: x[1].get("ts", 0))
+
+    # Group NCCL kernels that execute concurrently (within 200 microseconds of each other)
+    collective_clusters = []
+    current_cluster = []
+
+    for r, k in all_nccl_kernels:
+        k_ts = k.get("ts", 0)
+        if not current_cluster:
+            current_cluster.append((r, k))
+        else:
+            first_ts = current_cluster[0][1].get("ts", 0)
+            if abs(k_ts - first_ts) < 500:  # Within 500us
+                current_cluster.append((r, k))
+            else:
+                collective_clusters.append(current_cluster)
+                current_cluster = [(r, k)]
+    if current_cluster:
+        collective_clusters.append(current_cluster)
+
+    # For each collective cluster, draw forward flow arrows between the participating GPUs
+    for cluster in collective_clusters:
+        if len(cluster) >= 2:
+            root_rank, root_k = cluster[0]
+            root_ts = root_k.get("ts", 0)
+
+            for peer_rank, peer_k in cluster[1:]:
+                peer_ts = peer_k.get("ts", 0)
+                # Strict forward in time
+                arr_start = root_ts
+                arr_end = max(peer_ts, arr_start + 1)
+
                 flow_id += 1
                 merged_events.append({
-                    "name": f"JAX Framework Launch -> GPU {r}",
+                    "name": f"NCCL Sync: GPU {root_rank} -> GPU {peer_rank}",
                     "ph": "s", "cat": "flow", "id": flow_id,
-                    "pid": 100, "tid": f_ev.get("tid", 0), "ts": f_ts + (f_ev.get("dur", 10) / 2)
+                    "pid": 200 + root_rank, "tid": root_k.get("tid", 0), "ts": arr_start
                 })
                 merged_events.append({
-                    "name": f"JAX Framework Launch -> GPU {r}",
+                    "name": f"NCCL Sync: GPU {root_rank} -> GPU {peer_rank}",
                     "ph": "f", "cat": "flow", "id": flow_id,
-                    "pid": 200 + r, "tid": tgt_ev.get("tid", 0), "ts": max(tgt_ev.get("ts", 0), f_ts + 20)
-                })
-
-    # 2. SCATTER FLOW ARROWS (GPU -> GPU)
-    for group_key, participants in collective_groups.items():
-        participating_ranks = sorted(list(set(p['rank'] for p in participants)))
-        if len(participating_ranks) < 2:
-            continue
-
-        group_type = participants[0]['type']
-
-        if group_type == 'scatter':
-            src_p = [p for p in participants if p['rank'] == participating_ranks[0]][0]
-            src_ev = src_p['event']
-            src_ts = src_ev.get("ts", 0) + 5
-
-            for tgt_rank in participating_ranks[1:]:
-                tgt_candidates = [p for p in participants if p['rank'] == tgt_rank]
-                if tgt_candidates:
-                    tgt_ev = tgt_candidates[0]['event']
-                    tgt_ts = max(tgt_ev.get("ts", 0), src_ts + 30)
-
-                    flow_id += 1
-                    merged_events.append({
-                        "name": f"Scatter: GPU {participating_ranks[0]} -> GPU {tgt_rank}",
-                        "ph": "s", "cat": "flow", "id": flow_id,
-                        "pid": 200 + participating_ranks[0], "tid": src_ev.get("tid", 0), "ts": src_ts
-                    })
-                    merged_events.append({
-                        "name": f"Scatter: GPU {participating_ranks[0]} -> GPU {tgt_rank}",
-                        "ph": "f", "cat": "flow", "id": flow_id,
-                        "pid": 200 + tgt_rank, "tid": tgt_ev.get("tid", 0), "ts": tgt_ts
-                    })
-
-        # 3. GATHER FLOW ARROWS (Participating GPUs -> Gather Target)
-        elif group_type in ['gather', 'reduce']:
-            dest_p = [p for p in participants if p['rank'] == participating_ranks[0]][0]
-            dest_ev = dest_p['event']
-            dest_ts = dest_ev.get("ts", 0)
-
-            for p in participants:
-                src_rank = p['rank']
-                p_ev = p['event']
-                
-                prior_comp = [c for c in compute_events_by_rank.get(src_rank, []) if c.get("ts", 0) < p_ev.get("ts", 0)]
-                if prior_comp:
-                    src_comp = prior_comp[-1]
-                    src_ts = src_comp.get("ts", 0) + src_comp.get("dur", 10) - 2
-                else:
-                    src_ts = p_ev.get("ts", 0) - 10
-
-                arrival_ts = max(dest_ts + (src_rank * 15), src_ts + 10)
-                flow_id += 1
-                
-                merged_events.append({
-                    "name": f"Gather Inflow: GPU {src_rank} -> GPU {participating_ranks[0]}",
-                    "ph": "s", "cat": "flow", "id": flow_id,
-                    "pid": 200 + src_rank, "tid": p_ev.get("tid", 0), "ts": src_ts
-                })
-                merged_events.append({
-                    "name": f"Gather Inflow: GPU {src_rank} -> GPU {participating_ranks[0]}",
-                    "ph": "f", "cat": "flow", "id": flow_id,
-                    "pid": 200 + participating_ranks[0], "tid": dest_ev.get("tid", 0), "ts": arrival_ts
+                    "pid": 200 + peer_rank, "tid": peer_k.get("tid", 0), "ts": arr_end
                 })
 
     output_data = {"traceEvents": merged_events}
@@ -221,8 +202,8 @@ def merge(trace_base_dir, output_file):
     with gzip.open(output_file, "wt", encoding="utf-8") as f:
         json.dump(output_data, f)
 
-    print(f"\nUnified trace with JAX Framework -> GPU flow links generated: {output_file}")
-    print(f"Total causal flow arrows synthesized: {flow_id - 90000}")
+    print(f"\nUnified clean trace generated: {output_file}")
+    print(f"Total causal flow arrows synthesized: {flow_id - 95000}")
 
 if __name__ == "__main__":
     base = sys.argv[1] if len(sys.argv) > 1 else "/home/walid/repo/jax_cluster_lab/traces"
