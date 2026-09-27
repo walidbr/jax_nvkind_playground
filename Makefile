@@ -2,22 +2,23 @@ SHELL := /bin/bash
 CLUSTER_NAME := nvkind-cluster
 DIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
-.PHONY: all help start stop enter-cp logs clean run-collectives run-sharding run-transformer run-profile
+.PHONY: all help start stop enter-cp logs clean run-collectives run-sharding run-transformer run-profile run-scatter-gather
 
 help:
 	@echo "=========================================================="
 	@echo "         JAX Distributed GPU Cluster Lab"
 	@echo "=========================================================="
 	@echo "Commands:"
-	@echo "  make start            - Start KIND cluster with GPU support & mounted workspace"
-	@echo "  make enter-cp         - Step into the control-plane container interactive shell"
-	@echo "  make stop             - Tear down the KIND cluster"
-	@echo "  make run-profile      - Run 4-GPU distributed trace & generate Perfetto 4-GPU view"
-	@echo "  make run-collectives  - Run 4-rank JAX Collectives on RTX 5090"
-	@echo "  make run-sharding     - Run 4-GPU 2D Rack Mesh Sharding MatMul"
-	@echo "  make run-transformer  - Run 4-GPU Megatron-style Transformer MLP"
-	@echo "  make logs             - View logs from the 4 ranks"
-	@echo "  make clean            - Kill any stale python cluster processes"
+	@echo "  make start               - Start KIND cluster with GPU support & mounted workspace"
+	@echo "  make enter-cp            - Step into the control-plane container interactive shell"
+	@echo "  make stop                - Tear down the KIND cluster"
+	@echo "  make run-scatter-gather  - Run Scatter/Gather with Flow Arrows & auto-open in Perfetto UI"
+	@echo "  make run-profile         - Run 4-GPU distributed trace & generate Perfetto 4-GPU view"
+	@echo "  make run-collectives     - Run 4-rank JAX Collectives on RTX 5090"
+	@echo "  make run-sharding        - Run 4-GPU 2D Rack Mesh Sharding MatMul"
+	@echo "  make run-transformer     - Run 4-GPU Megatron-style Transformer MLP"
+	@echo "  make logs                - View logs from the 4 ranks"
+	@echo "  make clean               - Kill any stale python cluster processes"
 	@echo "=========================================================="
 
 start:
@@ -55,13 +56,18 @@ run-profile:
 	@echo "Merging 4 rank traces into a unified 4-GPU Perfetto timeline..."
 	@$(DIR)/.venv/bin/python $(DIR)/merge_traces.py $(DIR)/traces $(DIR)/traces/unified_4gpu_cluster.trace.json.gz
 	@echo ""
-	@echo "=========================================================="
-	@echo " 4-GPU Trace Ready!"
-	@echo " File: $(DIR)/traces/unified_4gpu_cluster.trace.json.gz"
+	@echo "Opening trace in Perfetto UI..."
+	@open_trace_in_ui $(DIR)/traces/unified_4gpu_cluster.trace.json.gz
+
+run-scatter-gather:
+	@rm -rf $(DIR)/traces
+	@$(DIR)/launch_cluster.sh 4 12388 $(DIR)/05_profiled_scatter_gather.py
 	@echo ""
-	@echo " To view: Open https://ui.perfetto.dev and drag that file into the window."
-	@echo " You will see distinct tracks for GPU 0, GPU 1, GPU 2, GPU 3!"
-	@echo "=========================================================="
+	@echo "Synthesizing Perfetto Flow Arrows across all 4 GPUs..."
+	@$(DIR)/.venv/bin/python $(DIR)/merge_traces.py $(DIR)/traces $(DIR)/traces/unified_4gpu_cluster.trace.json.gz
+	@echo ""
+	@echo "Opening trace in Perfetto UI..."
+	@open_trace_in_ui $(DIR)/traces/unified_4gpu_cluster.trace.json.gz
 
 logs:
 	@for r in 0 1 2 3; do \
@@ -75,17 +81,5 @@ clean:
 	@pkill -9 -f "02_sharding_and_placement.py" 2>/dev/null || true
 	@pkill -9 -f "03_model_parallel_transformer.py" 2>/dev/null || true
 	@pkill -9 -f "04_profiled_collectives.py" 2>/dev/null || true
+	@pkill -9 -f "05_profiled_scatter_gather.py" 2>/dev/null || true
 	@echo "Cleaned up active cluster processes."
-
-run-scatter-gather:
-	@rm -rf $(DIR)/traces
-	@$(DIR)/launch_cluster.sh 4 12388 $(DIR)/05_profiled_scatter_gather.py
-	@echo ""
-	@echo "Synthesizing Perfetto Flow Arrows across all 4 GPUs..."
-	@$(DIR)/.venv/bin/python $(DIR)/merge_traces.py $(DIR)/traces $(DIR)/traces/unified_4gpu_cluster.trace.json.gz
-	@echo ""
-	@echo "=========================================================="
-	@echo " Done! Open https://ui.perfetto.dev and load:"
-	@echo " $(DIR)/traces/unified_4gpu_cluster.trace.json.gz"
-	@echo " Click any 'OP_SCATTER' or 'OP_GATHER' span to see the interactive flow arrows!"
-	@echo "=========================================================="
