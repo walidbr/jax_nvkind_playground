@@ -76,3 +76,16 @@ clean:
 	@pkill -9 -f "03_model_parallel_transformer.py" 2>/dev/null || true
 	@pkill -9 -f "04_profiled_collectives.py" 2>/dev/null || true
 	@echo "Cleaned up active cluster processes."
+
+run-scatter-gather:
+	@rm -rf $(DIR)/traces
+	@$(DIR)/launch_cluster.sh 4 12388 $(DIR)/05_profiled_scatter_gather.py
+	@echo ""
+	@echo "Synthesizing Perfetto Flow Arrows across all 4 GPUs..."
+	@$(DIR)/.venv/bin/python $(DIR)/merge_traces.py $(DIR)/traces $(DIR)/traces/unified_4gpu_cluster.trace.json.gz
+	@echo ""
+	@echo "=========================================================="
+	@echo " Done! Open https://ui.perfetto.dev and load:"
+	@echo " $(DIR)/traces/unified_4gpu_cluster.trace.json.gz"
+	@echo " Click any 'OP_SCATTER' or 'OP_GATHER' span to see the interactive flow arrows!"
+	@echo "=========================================================="
